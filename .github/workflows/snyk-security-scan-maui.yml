@@ -1,0 +1,46 @@
+name: Snyk Security Scan MAUI (.NET)
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:  
+  test:
+    runs-on: ubuntu-latest    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Update Workloads
+        run: dotnet workload update
+
+      - name: Install Workloads
+        shell: pwsh
+        run: |
+          dotnet workload install android
+          dotnet workload install ios
+          dotnet workload install maccatalyst
+          dotnet workload install maui
+
+      - name: Build 
+        run: dotnet build src/ClientApp/ClientApp.csproj
+        
+      - name: Test
+        run: dotnet test --project tests/ClientApp.UnitTests/ClientApp.UnitTests.csproj --no-progress --output detailed
+
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Run Snyk Code
+        run: snyk code test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}

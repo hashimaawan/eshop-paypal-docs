@@ -1,0 +1,95 @@
+@page "/user/orders"
+@attribute [Authorize]
+@attribute [StreamRendering]
+@inject OrderingService OrderingService
+
+<PageTitle>Orders | AdventureWorks</PageTitle>
+<SectionContent SectionName="page-header-title">Orders</SectionContent>
+<OrdersRefreshOnStatusChange />
+
+<div class="orders">
+@if (orders is null)
+{
+    <p>Loading...</p>
+}
+else if (orders.Length == 0)
+{
+    <p>You haven't yet placed any orders.</p>
+}
+else
+{
+    <ul class="orders-list">
+        <li class="orders-header orders-item">
+            <div>Number</div>
+            <div>Date</div>
+            <div class="total-header">Total</div>
+            <div>Status</div>
+            <div>Actions</div>
+        </li>
+        @foreach (var order in orders)
+        {
+            <li class="orders-item">
+                <div class="order-number">
+                    @order.OrderNumber
+                </div>
+                <div class="order-date">
+                    @order.Date
+                </div>
+                <div class="order-total">
+                   $@order.Total.ToString("0.00")
+                </div>
+                <div class="order-status">
+                    <span class="status @order.Status.ToLower()">
+                        @order.Status
+                    </span>
+                </div>
+                <div class="order-actions">
+                    @if (CanCancel(order.Status))
+                    {
+                        <EditForm Model="@CancelInput" FormName="@($"cancel-order-{order.OrderNumber}")" OnSubmit="@HandleCancelAsync" Enhance>
+                            <input type="hidden" name="CancelInput.OrderNumber" value="@order.OrderNumber" />
+                            <button type="submit" class="button button-secondary">Cancel order</button>
+                        </EditForm>
+                    }
+                </div>
+            </li>
+        }
+    </ul>
+}
+</div>
+
+@code {
+    private OrderRecord[]? orders;
+
+    [SupplyParameterFromForm]
+    public CancelOrderModel CancelInput { get; set; } = default!;
+
+    protected override async Task OnInitializedAsync()
+    {
+        CancelInput ??= new();
+        orders = await OrderingService.GetOrders();
+    }
+
+    private async Task HandleCancelAsync()
+    {
+        if (CancelInput?.OrderNumber > 0)
+        {
+            await OrderingService.CancelOrder(CancelInput.OrderNumber, Guid.NewGuid());
+        }
+
+        CancelInput = new();
+
+        // Re-fetch so the list reflects the new (Cancelled) status.
+        orders = await OrderingService.GetOrders();
+    }
+
+    // An order can be cancelled only before it is paid (mirrors the domain rule:
+    // cancelling a Paid or Shipped order is forbidden).
+    private static bool CanCancel(string status)
+        => status is "Submitted" or "AwaitingValidation" or "StockConfirmed";
+
+    public class CancelOrderModel
+    {
+        public int OrderNumber { get; set; }
+    }
+}
