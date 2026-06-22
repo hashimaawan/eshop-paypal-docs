@@ -93,5 +93,7 @@
     <PackageVersion Include="Scalar.AspNetCore" Version="2.8.6" />
     <!-- Before license change -->
     <PackageVersion Include="MediatR" Version="13.0.0" />
+    <!-- PayPal Server SDK (Orders v2 / Payments v2) for the PayPal payment integration. -->
+    <PackageVersion Include="PayPalServerSDK" Version="2.3.0" />
   </ItemGroup>
 </Project>

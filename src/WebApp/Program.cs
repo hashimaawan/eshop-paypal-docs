@@ -19,6 +19,9 @@ builder.Services.AddSession(options =>
 
 builder.AddApplicationServices();
 
+// PayPal Server SDK based checkout (UC1: create order + authorize).
+builder.AddPayPalCheckout();
+
 var app = builder.Build();
 
 app.MapDefaultEndpoints();

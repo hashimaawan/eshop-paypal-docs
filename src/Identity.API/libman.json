@@ -3,6 +3,7 @@
   "defaultProvider": "cdnjs",
   "libraries": [
     {
+      "provider": "jsdelivr",
       "library": "jquery@3.6.3",
       "destination": "wwwroot/lib/jquery/"
     },

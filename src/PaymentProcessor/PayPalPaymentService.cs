@@ -1,134 +1,151 @@
-#nullable enable
 using System.Globalization;
-using System.Net;
-using System.Net.Http.Headers;
-using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json.Serialization;
+using PaypalServerSdk.Standard;
+using PaypalServerSdk.Standard.Controllers;
+using PaypalServerSdk.Standard.Exceptions;
+using PaypalServerSdk.Standard.Http.Response;
+using PaypalServerSdk.Standard.Models;
 
 namespace eShop.PaymentProcessor;
 
+/// <summary>
+/// Captures, re-authorizes and voids PayPal authorizations through the PayPal Server SDK.
+/// Replaces the previous hand-rolled HTTP implementation: every PayPal interaction now flows through
+/// the SDK's <see cref="PaymentsController"/>. PayPal failures are always translated into a local
+/// outcome (bool / no-op) and never surface SDK exception types to the integration-event handlers.
+/// </summary>
 public sealed class PayPalPaymentService(
+    PaypalServerSdkClient payPalClient,
     IOrderingApiClient orderingApiClient,
-    IHttpClientFactory httpClientFactory,
     IOptionsMonitor<PaymentOptions> options,
     ILogger<PayPalPaymentService> logger) : IPaymentService
 {
-    // UC2 + UC3: Capture the held authorization when stock is confirmed.
+    private const string PreferRepresentation = "return=representation";
+
+    // UC2 + UC3: capture the held authorization when stock is confirmed, re-authorizing first if the
+    // 3-day honor window has elapsed. Returns true only when funds are actually captured.
     public async Task<bool> ProcessPaymentAsync(int orderId, CancellationToken cancellationToken = default)
     {
         var settings = options.CurrentValue;
 
-        if (!settings.UsePayPal ||
-            string.IsNullOrWhiteSpace(settings.PayPalClientId) ||
-            string.IsNullOrWhiteSpace(settings.PayPalClientSecret))
+        if (!settings.IsPayPalConfigured)
         {
-            logger.LogInformation("PayPal not configured; falling back to PaymentSucceeded flag for order {OrderId}", orderId);
+            logger.LogInformation(
+                "PayPal disabled or unconfigured; falling back to simulated PaymentSucceeded={PaymentSucceeded} for order {OrderId}",
+                settings.PaymentSucceeded, orderId);
             return settings.PaymentSucceeded;
         }
 
         var order = await orderingApiClient.GetOrderAsync(orderId, cancellationToken);
         if (order is null)
         {
-            logger.LogWarning("Unable to load order {OrderId} from Ordering.API", orderId);
+            logger.LogWarning("Unable to load order {OrderId} from Ordering.API; treating payment as failed", orderId);
             return false;
         }
 
         if (string.IsNullOrWhiteSpace(order.PayPalAuthorizationId))
         {
-            logger.LogWarning("Order {OrderId} has no PayPalAuthorizationId; falling back to PaymentSucceeded flag", orderId);
+            logger.LogWarning(
+                "Order {OrderId} has no PayPalAuthorizationId; falling back to simulated PaymentSucceeded flag", orderId);
             return settings.PaymentSucceeded;
         }
 
+        // C5: bound the whole operation (including the resilience handler's retries+backoff) by a total
+        // budget sourced from configuration, linked to the caller's token.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(settings.TotalTimeoutSeconds));
+        var ct = cts.Token;
+
+        var payments = payPalClient.PaymentsController;
+        var authorizationId = order.PayPalAuthorizationId!;
+
         try
         {
-            var client = CreatePayPalClient(settings);
-            var accessToken = await GetAccessTokenAsync(client, settings, cancellationToken);
-            if (string.IsNullOrEmpty(accessToken))
+            // UC3: inspect the held authorization and re-authorize if it is past the honor window.
+            var authorization = await GetAuthorizationOrNullAsync(payments, authorizationId, orderId, ct);
+            if (authorization is null)
             {
-                logger.LogWarning("Could not obtain PayPal access token for order {OrderId}", orderId);
                 return false;
             }
 
-            var authorizationId = order.PayPalAuthorizationId;
-
-            // UC3: inspect authorization age and re-authorize if past the 3-day honor window.
-            var authDetails = await GetAuthorizationAsync(client, accessToken, authorizationId, cancellationToken);
-            if (authDetails is null)
+            if (authorization.Status is AuthorizationStatus.Voided or AuthorizationStatus.Captured or AuthorizationStatus.Denied)
             {
-                logger.LogWarning("Could not retrieve PayPal authorization {AuthId} for order {OrderId}", authorizationId, orderId);
+                logger.LogWarning(
+                    "Authorization {AuthId} for order {OrderId} is already {Status}; cannot capture",
+                    authorizationId, orderId, authorization.Status);
                 return false;
             }
 
-            if (string.Equals(authDetails.Status, "VOIDED", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(authDetails.Status, "CAPTURED", StringComparison.OrdinalIgnoreCase))
+            if (TryGetAuthorizationAgeDays(authorization, out var ageDays))
             {
-                logger.LogWarning("Authorization {AuthId} for order {OrderId} is already {Status}", authorizationId, orderId, authDetails.Status);
-                return false;
-            }
-
-            if (authDetails.CreateTime.HasValue)
-            {
-                var ageDays = (DateTime.UtcNow - authDetails.CreateTime.Value).TotalDays;
-
-                if (ageDays >= 29)
+                if (ageDays >= settings.ValidityWindowDays)
                 {
-                    // Authorization expired — cannot capture or re-authorize.
-                    logger.LogWarning("Authorization {AuthId} for order {OrderId} has expired ({AgeDays:F1} days old)", authorizationId, orderId, ageDays);
+                    logger.LogWarning(
+                        "Authorization {AuthId} for order {OrderId} has expired ({AgeDays:F1} days old); cannot capture or re-authorize",
+                        authorizationId, orderId, ageDays);
                     return false;
                 }
 
-                if (ageDays >= 3)
+                if (ageDays >= settings.HonorWindowDays)
                 {
-                    // UC3: Past the 3-day honor window — re-authorize to get a fresh hold.
-                    logger.LogInformation("Authorization {AuthId} is {AgeDays:F1} days old; re-authorizing for order {OrderId}", authorizationId, ageDays, orderId);
-                    var reauthKey = $"reauth-{orderId}-{authorizationId}";
-                    var newAuthId = await ReauthorizeAsync(client, accessToken, authorizationId, order.Total, settings.CurrencyCode, reauthKey, cancellationToken);
-                    if (string.IsNullOrEmpty(newAuthId))
+                    logger.LogInformation(
+                        "Authorization {AuthId} is {AgeDays:F1} days old (past the {HonorWindow}-day honor window); re-authorizing for order {OrderId}",
+                        authorizationId, ageDays, settings.HonorWindowDays, orderId);
+
+                    var newAuthorizationId = await ReauthorizeAsync(payments, authorizationId, order.Total, settings, orderId, ct);
+                    if (string.IsNullOrEmpty(newAuthorizationId))
                     {
-                        logger.LogWarning("Re-authorization failed for order {OrderId}", orderId);
                         return false;
                     }
-                    authorizationId = newAuthId;
-                    logger.LogInformation("Re-authorization succeeded. New authorization {AuthId} for order {OrderId}", authorizationId, orderId);
 
-                    // UC3/§5: the refreshed authorization id must travel with the order so a
-                    // later void (UC4/UC5) releases the live hold rather than the stale one.
+                    authorizationId = newAuthorizationId;
+                    logger.LogInformation(
+                        "Re-authorization succeeded. New authorization {AuthId} for order {OrderId}", authorizationId, orderId);
+
+                    // §5: the refreshed authorization id must travel with the order so a later void
+                    // releases the live hold rather than the stale one. Record-keeping uses the caller's
+                    // token (not the time-boxed one) so the self-imposed budget can't drop the update.
                     await orderingApiClient.UpdatePayPalReferencesAsync(orderId, authorizationId, null, cancellationToken);
                 }
             }
 
-            // UC2: Capture the (possibly re-authorized) hold.
-            var captureKey = $"capture-{orderId}-{authorizationId}";
-            var captureId = await CaptureAuthorizationAsync(client, accessToken, authorizationId, captureKey, cancellationToken);
+            // UC2: capture the (possibly re-authorized) hold.
+            var captureId = await CaptureAsync(payments, authorizationId, order.Total, settings, orderId, ct);
             if (string.IsNullOrEmpty(captureId))
             {
-                logger.LogWarning("PayPal capture for order {OrderId} did not complete", orderId);
                 return false;
             }
 
-            logger.LogInformation("PayPal capture for order {OrderId} succeeded. CaptureId={CaptureId}", orderId, captureId);
+            logger.LogInformation(
+                "PayPal capture for order {OrderId} succeeded. AuthorizationId={AuthId} CaptureId={CaptureId} Amount={Amount} {Currency}",
+                orderId, authorizationId, captureId, FormatAmount(order.Total, settings), settings.CurrencyCode);
 
-            // §5: record the capture id as the settlement reference on the order.
             await orderingApiClient.UpdatePayPalReferencesAsync(orderId, null, captureId, cancellationToken);
-
             return true;
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            logger.LogError(ex, "Error processing PayPal payment for order {OrderId}", orderId);
+            // Our own total-budget timeout (or a transport timeout) — treat as a failed payment so it
+            // routes to eShop's existing payment-failed -> cancelled path rather than escaping the handler.
+            logger.LogWarning(
+                "PayPal capture for order {OrderId} timed out within the {TotalTimeout}s budget; treating as failed",
+                orderId, settings.TotalTimeoutSeconds);
             return false;
+        }
+        catch (OperationCanceledException)
+        {
+            // Caller-initiated cancellation (host shutdown): propagate so the work is not silently dropped.
+            throw;
         }
     }
 
-    // UC4 + UC5: Void the authorization when the order is cancelled before capture.
+    // UC4 + UC5: void the authorization when the order is cancelled before capture. A void failure is
+    // isolated — it never blocks eShop's cancellation; the discrepancy is logged and the un-captured
+    // hold lapses on its own.
     public async Task VoidAuthorizationAsync(int orderId, CancellationToken cancellationToken = default)
     {
         var settings = options.CurrentValue;
 
-        if (!settings.UsePayPal ||
-            string.IsNullOrWhiteSpace(settings.PayPalClientId) ||
-            string.IsNullOrWhiteSpace(settings.PayPalClientSecret))
+        if (!settings.IsPayPalConfigured)
         {
             return;
         }
@@ -140,172 +157,250 @@ public sealed class PayPalPaymentService(
             return;
         }
 
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(settings.TotalTimeoutSeconds));
+        var ct = cts.Token;
+
+        var authorizationId = order.PayPalAuthorizationId!;
+
         try
         {
-            var client = CreatePayPalClient(settings);
-            var accessToken = await GetAccessTokenAsync(client, settings, cancellationToken);
-            if (string.IsNullOrEmpty(accessToken))
+            var input = new VoidPaymentInput
             {
-                logger.LogWarning("Could not obtain PayPal access token for void of order {OrderId}", orderId);
-                return;
-            }
+                AuthorizationId = authorizationId,
+                // §3.2 idempotency: a retry with the same key never voids twice.
+                PaypalRequestId = $"void-{orderId}-{authorizationId}",
+            };
 
-            var voidKey = $"void-{orderId}-{order.PayPalAuthorizationId}";
-            await VoidAuthorizationCoreAsync(client, accessToken, order.PayPalAuthorizationId, orderId, voidKey, cancellationToken);
+            await payPalClient.PaymentsController.VoidPaymentAsync(input, ct);
+            logger.LogInformation("Voided PayPal authorization {AuthId} for order {OrderId}", authorizationId, orderId);
+        }
+        catch (ApiException ex) when (ex.ResponseCode is 422 or 409 or 404)
+        {
+            // Already voided/captured, or no longer present — idempotent outcome, nothing to do.
+            logger.LogInformation(
+                "Void of authorization {AuthId} for order {OrderId} was a no-op ({Status}: {Reason})",
+                authorizationId, orderId, ex.ResponseCode, DescribeError(ex));
+        }
+        catch (ApiException ex)
+        {
+            // Any other PayPal error must not block cancellation — log for reconciliation and move on.
+            logger.LogWarning(
+                "PayPal void failed for order {OrderId} (Status={Status}: {Reason}); order is still cancelled, hold will lapse",
+                orderId, ex.ResponseCode, DescribeError(ex));
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogWarning("PayPal void for order {OrderId} was cancelled/timed out; order is still cancelled, hold will lapse", orderId);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error voiding PayPal authorization for order {OrderId}", orderId);
+            // A void failure must never block eShop's cancellation.
+            logger.LogWarning(ex, "Unexpected error voiding PayPal authorization for order {OrderId}; order is still cancelled, hold will lapse", orderId);
         }
     }
 
-    // ---- private helpers ----
+    // ---- SDK-wrapping helpers (all SDK exception types are caught here, never leaked) ----
 
-    private HttpClient CreatePayPalClient(PaymentOptions settings)
+    private async Task<PaymentAuthorization?> GetAuthorizationOrNullAsync(
+        PaymentsController payments, string authorizationId, int orderId, CancellationToken ct)
     {
-        var client = httpClientFactory.CreateClient("paypal");
-        var baseUrl = settings.PayPalEnvironment?.Equals("Live", StringComparison.OrdinalIgnoreCase) == true
-            ? "https://api-m.paypal.com"
-            : "https://api-m.sandbox.paypal.com";
-        client.BaseAddress ??= new Uri(baseUrl);
-        return client;
-    }
-
-    private static async Task<string?> GetAccessTokenAsync(
-        HttpClient client, PaymentOptions settings, CancellationToken ct)
-    {
-        var credentials = Convert.ToBase64String(
-            Encoding.ASCII.GetBytes($"{settings.PayPalClientId}:{settings.PayPalClientSecret}"));
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/oauth2/token");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
-        request.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["grant_type"] = "client_credentials" });
-
-        var response = await client.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) return null;
-
-        var payload = await response.Content.ReadFromJsonAsync<PayPalTokenResponse>(cancellationToken: ct);
-        return payload?.AccessToken;
-    }
-
-    // GET /v2/payments/authorizations/{id} — used to check age for UC3.
-    private static async Task<PayPalAuthorizationDetails?> GetAuthorizationAsync(
-        HttpClient client, string accessToken, string authorizationId, CancellationToken ct)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"/v2/payments/authorizations/{authorizationId}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-        var response = await client.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) return null;
-
-        return await response.Content.ReadFromJsonAsync<PayPalAuthorizationDetails>(cancellationToken: ct);
-    }
-
-    // POST /v2/payments/authorizations/{id}/reauthorize — UC3.
-    private static async Task<string?> ReauthorizeAsync(
-        HttpClient client, string accessToken, string authorizationId,
-        decimal amount, string currencyCode, string requestId, CancellationToken ct)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"/v2/payments/authorizations/{authorizationId}/reauthorize");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        // §3.2 idempotency: a retry with the same key never places a second hold.
-        request.Headers.Add("PayPal-Request-Id", requestId);
-        request.Content = JsonContent.Create(new
+        try
         {
-            amount = new
+            var input = new GetAuthorizedPaymentInput { AuthorizationId = authorizationId };
+            ApiResponse<PaymentAuthorization> response = await payments.GetAuthorizedPaymentAsync(input, ct);
+
+            if (response?.Data is null)
             {
-                currency_code = currencyCode,
-                value = amount.ToString("F2", CultureInfo.InvariantCulture)
+                logger.LogWarning("PayPal returned an empty authorization body for {AuthId} (order {OrderId})", authorizationId, orderId);
+                return null;
             }
-        });
 
-        var response = await client.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) return null;
-
-        var payload = await response.Content.ReadFromJsonAsync<PayPalReauthorizeResponse>(cancellationToken: ct);
-        return payload?.Id;
-    }
-
-    // POST /v2/payments/authorizations/{id}/capture — UC2. Returns the capture id when COMPLETED.
-    private static async Task<string?> CaptureAuthorizationAsync(
-        HttpClient client, string accessToken, string authorizationId, string requestId, CancellationToken ct)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"/v2/payments/authorizations/{authorizationId}/capture");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        // §3.2 idempotency: a retry with the same key never captures twice.
-        request.Headers.Add("PayPal-Request-Id", requestId);
-        request.Content = JsonContent.Create(new { });
-
-        var response = await client.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) return null;
-
-        var payload = await response.Content.ReadFromJsonAsync<PayPalCaptureResponse>(cancellationToken: ct);
-        return string.Equals(payload?.Status, "COMPLETED", StringComparison.OrdinalIgnoreCase) ? payload?.Id : null;
-    }
-
-    // POST /v2/payments/authorizations/{id}/void — UC4/UC5.
-    private async Task VoidAuthorizationCoreAsync(
-        HttpClient client, string accessToken, string authorizationId, int orderId, string requestId, CancellationToken ct)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"/v2/payments/authorizations/{authorizationId}/void");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        // §3.2 idempotency: a retry with the same key never voids twice.
-        request.Headers.Add("PayPal-Request-Id", requestId);
-
-        var response = await client.SendAsync(request, ct);
-
-        if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
+            return response.Data;
+        }
+        catch (ApiException ex)
         {
-            // Already voided or captured — idempotent, nothing to do.
-            logger.LogInformation("Authorization {AuthId} for order {OrderId} was already voided or captured", authorizationId, orderId);
+            logger.LogWarning(
+                "Could not retrieve PayPal authorization {AuthId} for order {OrderId} (Status={Status}: {Reason})",
+                authorizationId, orderId, ex.ResponseCode, DescribeError(ex));
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Any non-API failure (e.g. a malformed/unparseable body) is handled at the boundary
+            // rather than crashing the integration-event handler.
+            logger.LogWarning(ex, "Unexpected error retrieving PayPal authorization {AuthId} for order {OrderId}", authorizationId, orderId);
+            return null;
+        }
+    }
+
+    private async Task<string?> ReauthorizeAsync(
+        PaymentsController payments, string authorizationId, decimal amount, PaymentOptions settings, int orderId, CancellationToken ct)
+    {
+        try
+        {
+            var input = new ReauthorizePaymentInput
+            {
+                AuthorizationId = authorizationId,
+                Prefer = PreferRepresentation,
+                // §3.2 idempotency: a retry with the same key never places a second hold.
+                PaypalRequestId = $"reauth-{orderId}-{authorizationId}",
+                Body = new ReauthorizeRequest
+                {
+                    Amount = new Money
+                    {
+                        CurrencyCode = settings.CurrencyCode,
+                        MValue = FormatAmount(amount, settings),
+                    },
+                },
+            };
+
+            ApiResponse<PaymentAuthorization> response = await payments.ReauthorizePaymentAsync(input, ct);
+            var data = response?.Data;
+
+            if (data is null || string.IsNullOrWhiteSpace(data.Id) || data.Status == AuthorizationStatus.Denied)
+            {
+                logger.LogWarning(
+                    "Re-authorization for order {OrderId} did not yield a usable authorization (Status={Status})",
+                    orderId, data?.Status);
+                return null;
+            }
+
+            return data.Id;
+        }
+        catch (ApiException ex)
+        {
+            logger.LogWarning(
+                "PayPal re-authorization failed for order {OrderId} (Status={Status}: {Reason})",
+                orderId, ex.ResponseCode, DescribeError(ex));
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Unexpected error re-authorizing PayPal payment for order {OrderId}", orderId);
+            return null;
+        }
+    }
+
+    private async Task<string?> CaptureAsync(
+        PaymentsController payments, string authorizationId, decimal expectedAmount, PaymentOptions settings, int orderId, CancellationToken ct)
+    {
+        try
+        {
+            var input = new CaptureAuthorizedPaymentInput
+            {
+                AuthorizationId = authorizationId,
+                Prefer = PreferRepresentation,
+                // §3.2 idempotency: a retry with the same key never captures twice.
+                PaypalRequestId = $"capture-{orderId}-{authorizationId}",
+                // eShop captures the full authorized amount exactly once; no partial/repeat captures.
+                Body = new CaptureRequest { FinalCapture = true },
+            };
+
+            ApiResponse<CapturedPayment> response = await payments.CaptureAuthorizedPaymentAsync(input, ct);
+            var data = response?.Data;
+
+            if (data is null)
+            {
+                logger.LogWarning("PayPal capture for order {OrderId} returned an empty body", orderId);
+                return null;
+            }
+
+            if (data.Status != CaptureStatus.Completed)
+            {
+                logger.LogWarning(
+                    "PayPal capture for order {OrderId} did not complete (Status={Status})", orderId, data.Status);
+                return null;
+            }
+
+            // H3: validate the captured currency/amount the vendor reports against what we expect.
+            ValidateCapturedAmount(data, expectedAmount, settings, orderId);
+
+            return data.Id;
+        }
+        catch (ApiException ex)
+        {
+            // A decline or any business/technical failure is a normal "payment failed" outcome here,
+            // routed to eShop's existing payment-failed -> cancelled path by the caller.
+            logger.LogWarning(
+                "PayPal capture failed for order {OrderId} (Status={Status}: {Reason})",
+                orderId, ex.ResponseCode, DescribeError(ex));
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A malformed/unparseable capture body or any other unexpected failure becomes a failed
+            // payment outcome (never an unhandled exception escaping into the saga).
+            logger.LogWarning(ex, "Unexpected error capturing PayPal payment for order {OrderId}", orderId);
+            return null;
+        }
+    }
+
+    // ---- utility ----
+
+    private void ValidateCapturedAmount(CapturedPayment capture, decimal expectedAmount, PaymentOptions settings, int orderId)
+    {
+        var amount = capture.Amount;
+        if (amount is null)
+        {
             return;
         }
 
-        if (!response.IsSuccessStatusCode)
+        if (!string.IsNullOrEmpty(amount.CurrencyCode) &&
+            !amount.CurrencyCode.Equals(settings.CurrencyCode, StringComparison.OrdinalIgnoreCase))
         {
-            var body = await response.Content.ReadAsStringAsync(ct);
-            logger.LogWarning("PayPal void failed for order {OrderId}: {Status} {Body}", orderId, response.StatusCode, body);
-            return;
+            logger.LogWarning(
+                "Captured currency {Captured} for order {OrderId} differs from configured {Expected}",
+                amount.CurrencyCode, orderId, settings.CurrencyCode);
         }
 
-        logger.LogInformation("Voided PayPal authorization {AuthId} for order {OrderId}", authorizationId, orderId);
+        if (decimal.TryParse(amount.MValue, NumberStyles.Number, CultureInfo.InvariantCulture, out var captured))
+        {
+            var tolerance = (decimal)Math.Pow(10, -settings.CurrencyDecimalPlaces);
+            if (Math.Abs(captured - expectedAmount) > tolerance)
+            {
+                logger.LogWarning(
+                    "Captured amount {Captured} for order {OrderId} differs from expected {Expected}",
+                    captured, orderId, expectedAmount);
+            }
+        }
     }
 
-    // ---- response DTOs ----
-
-    private sealed class PayPalTokenResponse
+    private static bool TryGetAuthorizationAgeDays(PaymentAuthorization authorization, out double ageDays)
     {
-        [JsonPropertyName("access_token")]
-        public string AccessToken { get; init; } = string.Empty;
+        ageDays = 0;
+        if (string.IsNullOrWhiteSpace(authorization.CreateTime))
+        {
+            return false;
+        }
+
+        if (!DateTimeOffset.TryParse(
+                authorization.CreateTime, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var createTime))
+        {
+            return false;
+        }
+
+        ageDays = (DateTimeOffset.UtcNow - createTime).TotalDays;
+        return true;
     }
 
-    private sealed class PayPalAuthorizationDetails
+    // H3: format money exactly to the currency's decimal places, rounding away from zero, invariant culture.
+    private static string FormatAmount(decimal amount, PaymentOptions settings)
     {
-        [JsonPropertyName("id")]
-        public string? Id { get; init; }
-
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
-
-        [JsonPropertyName("create_time")]
-        public DateTime? CreateTime { get; init; }
-
-        [JsonPropertyName("expiration_time")]
-        public DateTime? ExpirationTime { get; init; }
+        var rounded = Math.Round(amount, settings.CurrencyDecimalPlaces, MidpointRounding.AwayFromZero);
+        return rounded.ToString("F" + settings.CurrencyDecimalPlaces, CultureInfo.InvariantCulture);
     }
 
-    private sealed class PayPalReauthorizeResponse
+    // Builds a non-secret, structured description of a PayPal error for logging (no tokens/PII).
+    private static string DescribeError(ApiException ex)
     {
-        [JsonPropertyName("id")]
-        public string? Id { get; init; }
-    }
+        if (ex is ErrorException error)
+        {
+            var issue = error.Details is { Count: > 0 } ? error.Details[0].Issue : null;
+            return $"{error.Name}/{issue} (debug_id={error.DebugId})";
+        }
 
-    private sealed class PayPalCaptureResponse
-    {
-        [JsonPropertyName("id")]
-        public string? Id { get; init; }
-
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
+        return ex.Message;
     }
 }

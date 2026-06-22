@@ -1,12 +1,18 @@
 using System.Globalization;
-using System.Net.Http.Headers;
-using System.Net.Http.Json;
 using System.Security.Claims;
-using System.Text;
-using System.Text.Json.Serialization;
+using Microsoft.Extensions.Options;
+using PaypalServerSdk.Standard;
+using PaypalServerSdk.Standard.Exceptions;
+using PaypalServerSdk.Standard.Http.Response;
+using PaypalServerSdk.Standard.Models;
 
 namespace eShop.WebApp.PayPal;
 
+/// <summary>
+/// UC1 — checkout with PayPal approval + authorization hold. Creates a PayPal order with AUTHORIZE
+/// intent, redirects the shopper to PayPal to approve, then authorizes the approved order (places the
+/// fund hold). All PayPal interactions go through the PayPal Server SDK's OrdersController.
+/// </summary>
 public static class PayPalEndpoints
 {
     public static void MapPayPalEndpoints(this IEndpointRouteBuilder app)
@@ -19,12 +25,14 @@ public static class PayPalEndpoints
     // UC1 step 1: create a PayPal order with AUTHORIZE intent and redirect the shopper to PayPal.
     private static async Task<IResult> CreateOrderAndRedirectAsync(
         HttpContext httpContext,
-        IConfiguration configuration,
-        IHttpClientFactory httpClientFactory,
+        IOptions<PayPalOptions> optionsAccessor,
+        PaypalServerSdkClient payPalClient,
         BasketPricingService basketPricingService,
         ILoggerFactory loggerFactory)
     {
         var logger = loggerFactory.CreateLogger("PayPalCreateOrder");
+        var options = optionsAccessor.Value;
+
         var total = await basketPricingService.GetBasketTotalAsync(httpContext.RequestAborted);
         if (total <= 0)
         {
@@ -32,7 +40,7 @@ public static class PayPalEndpoints
         }
 
         // E2E test mode: bypass real PayPal API and go straight to /paypal/return.
-        if (configuration.GetValue<bool>("PayPal:E2ETestMode"))
+        if (options.E2ETestMode)
         {
             logger.LogInformation("E2E test mode: skipping PayPal order creation.");
             var fakeOrderId = "e2e-test-" + Guid.NewGuid().ToString("N");
@@ -40,66 +48,54 @@ public static class PayPalEndpoints
             return Results.Redirect("/paypal/return?token=" + Uri.EscapeDataString(fakeOrderId));
         }
 
-        var env = configuration["PayPal:Environment"] ?? "Sandbox";
-        var clientId = configuration["PayPal:ClientId"];
-        var clientSecret = configuration["PayPal:ClientSecret"];
-        var returnUrl = configuration["PayPal:RedirectUri"];
-        var cancelUrl = configuration["PayPal:CancelUrl"];
-        var currency = configuration["PayPal:CurrencyCode"] ?? "USD";
-
-        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret) ||
-            string.IsNullOrWhiteSpace(returnUrl) || string.IsNullOrWhiteSpace(cancelUrl))
+        if (!options.IsConfigured)
         {
             return Results.BadRequest("PayPal is not configured.");
         }
 
-        var baseUrl = env.Equals("Live", StringComparison.OrdinalIgnoreCase)
-            ? "https://api-m.paypal.com"
-            : "https://api-m.sandbox.paypal.com";
-
-        var client = httpClientFactory.CreateClient();
-        client.BaseAddress = new Uri(baseUrl);
-
-        var accessToken = await GetAccessTokenAsync(client, clientId, clientSecret, logger, httpContext.RequestAborted);
-        if (accessToken is null)
-            return Results.Problem("Unable to start PayPal payment.");
-
         // Create order with AUTHORIZE intent — funds are held, not taken, until capture at stock-confirmed.
-        using var orderReq = new HttpRequestMessage(HttpMethod.Post, "/v2/checkout/orders");
-        orderReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        var amount = new
+        var shipping = BuildShippingFromClaims(httpContext.User);
+        var createOrderInput = new CreateOrderInput
         {
-            currency_code = currency,
-            value = total.ToString("F2", CultureInfo.InvariantCulture)
+            Body = new OrderRequest
+            {
+                Intent = CheckoutPaymentIntent.Authorize,
+                PurchaseUnits = new List<PurchaseUnitRequest>
+                {
+                    new PurchaseUnitRequest
+                    {
+                        // §3.3: a single item total — eShop models no separate tax/shipping lines.
+                        Amount = new AmountWithBreakdown
+                        {
+                            CurrencyCode = options.CurrencyCode,
+                            MValue = FormatAmount(total, options),
+                        },
+                        Shipping = shipping,
+                    },
+                },
+                ApplicationContext = new OrderApplicationContext
+                {
+                    ReturnUrl = options.RedirectUri,
+                    CancelUrl = options.CancelUrl,
+                    ShippingPreference = shipping is null
+                        ? OrderApplicationContextShippingPreference.GetFromFile
+                        : OrderApplicationContextShippingPreference.SetProvidedAddress,
+                },
+            },
         };
 
-        // UC1/§3.3: pass the shipping address eShop collected so the shopper sees
-        // consistent details at PayPal. Omitted gracefully if we can't form a valid address.
-        var shipping = BuildShippingFromClaims(httpContext.User);
-        object purchaseUnit = shipping is null
-            ? new { amount }
-            : new { amount, shipping };
-
-        orderReq.Content = JsonContent.Create(new
+        Order order;
+        try
         {
-            intent = "AUTHORIZE",
-            purchase_units = new[] { purchaseUnit },
-            application_context = new
-            {
-                return_url = returnUrl,
-                cancel_url = cancelUrl
-            }
-        });
-
-        var orderResp = await client.SendAsync(orderReq, httpContext.RequestAborted);
-        if (!orderResp.IsSuccessStatusCode)
+            ApiResponse<Order> response = await payPalClient.OrdersController.CreateOrderAsync(createOrderInput, httpContext.RequestAborted);
+            order = response.Data;
+        }
+        catch (ApiException ex)
         {
-            var body = await orderResp.Content.ReadAsStringAsync();
-            logger.LogError("Error creating PayPal order: {Status} {Body}", orderResp.StatusCode, body);
+            logger.LogError("Error creating PayPal order: {Status} {Reason}", ex.ResponseCode, DescribeError(ex));
             return Results.Problem("Unable to start PayPal payment.");
         }
 
-        var order = await orderResp.Content.ReadFromJsonAsync<PayPalOrderResponse>(cancellationToken: httpContext.RequestAborted);
         if (order is null || string.IsNullOrWhiteSpace(order.Id))
         {
             logger.LogError("Invalid PayPal order response: missing order id.");
@@ -109,10 +105,10 @@ public static class PayPalEndpoints
         // Store the order id in session; validated when the shopper returns from PayPal.
         httpContext.Session.SetString(PayPalSessionKeys.OrderId, order.Id);
 
-        var approveLink = order.Links?.FirstOrDefault(l => l.Rel == "approve")?.Href;
+        var approveLink = order.Links?.FirstOrDefault(l => string.Equals(l.Rel, "approve", StringComparison.OrdinalIgnoreCase))?.Href;
         if (string.IsNullOrWhiteSpace(approveLink))
         {
-            logger.LogError("No approval link in PayPal order response.");
+            logger.LogError("No approval link in PayPal order response for order {OrderId}.", order.Id);
             return Results.Problem("Unable to start PayPal payment.");
         }
 
@@ -120,28 +116,32 @@ public static class PayPalEndpoints
     }
 
     // UC1 step 2: shopper returns from PayPal having approved the payment.
-    // We call /authorize here to place the fund hold, then redirect to checkout.
+    // We authorize here to place the fund hold, then redirect to checkout.
     private static async Task<IResult> AuthorizeOrderAsync(
         HttpContext httpContext,
-        IConfiguration configuration,
-        IHttpClientFactory httpClientFactory,
+        IOptions<PayPalOptions> optionsAccessor,
+        PaypalServerSdkClient payPalClient,
         ILoggerFactory loggerFactory)
     {
         var logger = loggerFactory.CreateLogger("PayPalAuthorizeOrder");
+        var options = optionsAccessor.Value;
+
         var orderId = httpContext.Request.Query["token"].ToString();
         if (string.IsNullOrWhiteSpace(orderId))
+        {
             return Results.BadRequest("Missing PayPal order token.");
+        }
 
         // Validate token against what we stored in session at order-creation time.
         var sessionOrderId = httpContext.Session.GetString(PayPalSessionKeys.OrderId);
         if (!string.Equals(orderId, sessionOrderId, StringComparison.Ordinal))
         {
-            logger.LogWarning("PayPal return token does not match session. token={Token}", orderId);
+            logger.LogWarning("PayPal return token does not match session.");
             return Results.Redirect("/checkout?error=payment_mismatch");
         }
 
         // E2E test mode: skip real authorize call.
-        if (configuration.GetValue<bool>("PayPal:E2ETestMode"))
+        if (options.E2ETestMode)
         {
             var fakeAuthId = "e2e-auth-" + Guid.NewGuid().ToString("N");
             httpContext.Session.SetString(PayPalSessionKeys.AuthorizationId, fakeAuthId);
@@ -150,41 +150,33 @@ public static class PayPalEndpoints
                 $"/checkout?paid=1&paypalOrderId={Uri.EscapeDataString(orderId)}&paypalAuthorizationId={Uri.EscapeDataString(fakeAuthId)}");
         }
 
-        var env = configuration["PayPal:Environment"] ?? "Sandbox";
-        var clientId = configuration["PayPal:ClientId"];
-        var clientSecret = configuration["PayPal:ClientSecret"];
-
-        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
-            return Results.Problem("PayPal is not configured.");
-
-        var baseUrl = env.Equals("Live", StringComparison.OrdinalIgnoreCase)
-            ? "https://api-m.paypal.com"
-            : "https://api-m.sandbox.paypal.com";
-
-        var client = httpClientFactory.CreateClient();
-        client.BaseAddress = new Uri(baseUrl);
-
-        var accessToken = await GetAccessTokenAsync(client, clientId, clientSecret, logger, httpContext.RequestAborted);
-        if (accessToken is null)
-            return Results.Redirect("/checkout?error=payment_failed");
-
-        // Authorize the shopper-approved order — places the fund hold.
-        using var authReq = new HttpRequestMessage(HttpMethod.Post, $"/v2/checkout/orders/{orderId}/authorize");
-        authReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        // §3.2 idempotency: a retry of the same approved order never authorizes twice.
-        authReq.Headers.Add("PayPal-Request-Id", $"authorize-{orderId}");
-        authReq.Content = JsonContent.Create(new { });
-
-        var authResp = await client.SendAsync(authReq, httpContext.RequestAborted);
-        if (!authResp.IsSuccessStatusCode)
+        if (!options.IsConfigured)
         {
-            var body = await authResp.Content.ReadAsStringAsync();
-            logger.LogError("Error authorizing PayPal order {OrderId}: {Status} {Body}", orderId, authResp.StatusCode, body);
+            return Results.Problem("PayPal is not configured.");
+        }
+
+        var authorizeInput = new AuthorizeOrderInput
+        {
+            Id = orderId,
+            // representation is required so the nested authorization id is returned.
+            Prefer = "return=representation",
+            // §3.2 idempotency: a retry of the same approved order never authorizes twice.
+            PaypalRequestId = $"authorize-{orderId}",
+        };
+
+        OrderAuthorizeResponse authorization;
+        try
+        {
+            ApiResponse<OrderAuthorizeResponse> response = await payPalClient.OrdersController.AuthorizeOrderAsync(authorizeInput, httpContext.RequestAborted);
+            authorization = response.Data;
+        }
+        catch (ApiException ex)
+        {
+            logger.LogError("Error authorizing PayPal order {OrderId}: {Status} {Reason}", orderId, ex.ResponseCode, DescribeError(ex));
             return Results.Redirect("/checkout?error=authorization_failed");
         }
 
-        var authData = await authResp.Content.ReadFromJsonAsync<PayPalAuthorizeOrderResponse>(cancellationToken: httpContext.RequestAborted);
-        var authorizationId = authData?.PurchaseUnits?
+        var authorizationId = authorization?.PurchaseUnits?
             .FirstOrDefault()?.Payments?.Authorizations?
             .FirstOrDefault()?.Id;
 
@@ -208,33 +200,10 @@ public static class PayPalEndpoints
 
     // ---- helpers ----
 
-    private static async Task<string?> GetAccessTokenAsync(
-        HttpClient client, string clientId, string clientSecret,
-        ILogger logger, CancellationToken ct)
-    {
-        var basic = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{clientId}:{clientSecret}"));
-        using var req = new HttpRequestMessage(HttpMethod.Post, "/v1/oauth2/token")
-        {
-            Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["grant_type"] = "client_credentials" })
-        };
-        req.Headers.Authorization = new AuthenticationHeaderValue("Basic", basic);
-
-        var resp = await client.SendAsync(req, ct);
-        if (!resp.IsSuccessStatusCode)
-        {
-            var body = await resp.Content.ReadAsStringAsync(ct);
-            logger.LogError("Error getting PayPal access token: {Status} {Body}", resp.StatusCode, body);
-            return null;
-        }
-
-        var token = await resp.Content.ReadFromJsonAsync<PayPalTokenResponse>(cancellationToken: ct);
-        return string.IsNullOrWhiteSpace(token?.AccessToken) ? null : token.AccessToken;
-    }
-
-    // Builds a PayPal shipping object from the address claims eShop already collects.
-    // Returns null (so the shipping block is omitted) when a valid 2-letter country
-    // code can't be determined, since PayPal rejects an address without one.
-    private static object? BuildShippingFromClaims(ClaimsPrincipal user)
+    // Builds a PayPal shipping object from the address claims eShop already collects. Returns null
+    // (so the shipping block is omitted) when a valid 2-letter country code can't be determined,
+    // since PayPal rejects an address without one.
+    private static ShippingDetails? BuildShippingFromClaims(ClaimsPrincipal user)
     {
         string? Claim(string type) => user.Claims.FirstOrDefault(c => c.Type == type)?.Value;
 
@@ -249,19 +218,25 @@ public static class PayPalEndpoints
             return null;
         }
 
-        var address = new
+        var shipping = new ShippingDetails
         {
-            address_line_1 = street,
-            admin_area_2 = city ?? string.Empty,
-            admin_area_1 = state ?? string.Empty,
-            postal_code = zip ?? string.Empty,
-            country_code = countryCode
+            Address = new Address
+            {
+                AddressLine1 = street,
+                AdminArea2 = city ?? string.Empty,
+                AdminArea1 = state ?? string.Empty,
+                PostalCode = zip ?? string.Empty,
+                CountryCode = countryCode,
+            },
         };
 
         var fullName = user.FindFirst("name")?.Value ?? user.Identity?.Name;
-        return string.IsNullOrWhiteSpace(fullName)
-            ? new { address }
-            : new { name = new { full_name = fullName }, address };
+        if (!string.IsNullOrWhiteSpace(fullName))
+        {
+            shipping.Name = new ShippingName { FullName = fullName };
+        }
+
+        return shipping;
     }
 
     // eShop stores country as free text (e.g. "U.S."); PayPal needs ISO 3166 alpha-2.
@@ -282,62 +257,22 @@ public static class PayPalEndpoints
         };
     }
 
-    // ---- response DTOs ----
-
-    private sealed class PayPalTokenResponse
+    // Format money exactly to the currency's decimal places, rounding away from zero, invariant culture.
+    private static string FormatAmount(decimal amount, PayPalOptions options)
     {
-        [JsonPropertyName("access_token")]
-        public string AccessToken { get; init; } = string.Empty;
+        var rounded = Math.Round(amount, options.CurrencyDecimalPlaces, MidpointRounding.AwayFromZero);
+        return rounded.ToString("F" + options.CurrencyDecimalPlaces, CultureInfo.InvariantCulture);
     }
 
-    private sealed class PayPalOrderResponse
+    // Non-secret, structured description of a PayPal error for logging (no tokens/PII).
+    private static string DescribeError(ApiException ex)
     {
-        [JsonPropertyName("id")]
-        public string Id { get; init; } = string.Empty;
+        if (ex is ErrorException error)
+        {
+            var issue = error.Details is { Count: > 0 } ? error.Details[0].Issue : null;
+            return $"{error.Name}/{issue} (debug_id={error.DebugId})";
+        }
 
-        [JsonPropertyName("links")]
-        public List<PayPalLink>? Links { get; init; }
-    }
-
-    private sealed class PayPalLink
-    {
-        [JsonPropertyName("rel")]
-        public string Rel { get; init; } = string.Empty;
-
-        [JsonPropertyName("href")]
-        public string Href { get; init; } = string.Empty;
-    }
-
-    private sealed class PayPalAuthorizeOrderResponse
-    {
-        [JsonPropertyName("id")]
-        public string? Id { get; init; }
-
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
-
-        [JsonPropertyName("purchase_units")]
-        public List<PayPalPurchaseUnit>? PurchaseUnits { get; init; }
-    }
-
-    private sealed class PayPalPurchaseUnit
-    {
-        [JsonPropertyName("payments")]
-        public PayPalPayments? Payments { get; init; }
-    }
-
-    private sealed class PayPalPayments
-    {
-        [JsonPropertyName("authorizations")]
-        public List<PayPalAuthorizationRef>? Authorizations { get; init; }
-    }
-
-    private sealed class PayPalAuthorizationRef
-    {
-        [JsonPropertyName("id")]
-        public string? Id { get; init; }
-
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
+        return ex.Message;
     }
 }

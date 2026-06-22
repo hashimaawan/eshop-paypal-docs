@@ -164,7 +164,8 @@ public sealed class OrderingApiTests : IClassFixture<OrderingApiFixture>
             CardTypeId: 1,
             Buyer: buyerId,
             Items: new List<BasketItem> { item },
-            PayPalOrderId: null);
+            PayPalOrderId: null,
+            PayPalAuthorizationId: null);
 
         var content = new StringContent(JsonSerializer.Serialize(orderRequest), UTF8Encoding.UTF8, "application/json")
         {
