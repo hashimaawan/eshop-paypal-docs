@@ -172,6 +172,14 @@ namespace Ordering.Infrastructure.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<string>("PayPalAuthorizationId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("PayPalCaptureId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<int?>("_buyerId")
                         .HasColumnType("integer")
                         .HasColumnName("BuyerId");

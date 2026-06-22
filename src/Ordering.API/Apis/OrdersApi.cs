@@ -11,6 +11,7 @@ public static class OrdersApi
 
         api.MapPut("/cancel", CancelOrderAsync);
         api.MapPut("/ship", ShipOrderAsync);
+        api.MapPut("{orderId:int}/paypal-references", UpdateOrderPayPalReferencesAsync);
         // Require authentication for accessing individual orders; internal services should use
         // proper service-to-service authentication instead of relying on anonymous access.
         api.MapGet("{orderId:int}", GetOrderAsync);
@@ -80,6 +81,23 @@ public static class OrdersApi
         return TypedResults.Ok();
     }
 
+    // UC2/UC3: PaymentProcessor records the capture id and any refreshed authorization id on the order.
+    public static async Task<Results<Ok, NotFound, BadRequest<string>>> UpdateOrderPayPalReferencesAsync(
+        int orderId,
+        UpdateOrderPayPalReferencesRequest request,
+        [AsParameters] OrderServices services)
+    {
+        var command = new UpdateOrderPayPalReferencesCommand(orderId, request.PayPalAuthorizationId, request.PayPalCaptureId);
+
+        var result = await services.Mediator.Send(command);
+        if (!result)
+        {
+            return TypedResults.NotFound();
+        }
+
+        return TypedResults.Ok();
+    }
+
     public static async Task<Results<Ok<Order>, NotFound>> GetOrderAsync(int orderId, [AsParameters] OrderServices services)
     {
         try
@@ -144,7 +162,7 @@ public static class OrdersApi
             var createOrderCommand = new CreateOrderCommand(request.Items, request.UserId, request.UserName, request.City, request.Street,
                 request.State, request.Country, request.ZipCode,
                 maskedCCNumber, request.CardHolderName, request.CardExpiration,
-                request.CardSecurityNumber, request.CardTypeId, request.PayPalOrderId);
+                request.CardSecurityNumber, request.CardTypeId, request.PayPalOrderId, request.PayPalAuthorizationId);
 
             var requestCreateOrder = new IdentifiedCommand<CreateOrderCommand, bool>(createOrderCommand, requestId);
 
@@ -186,5 +204,10 @@ public record CreateOrderRequest(
     int CardTypeId,
     string Buyer,
     List<BasketItem> Items,
-    string? PayPalOrderId);
+    string? PayPalOrderId,
+    string? PayPalAuthorizationId);
+
+public record UpdateOrderPayPalReferencesRequest(
+    string? PayPalAuthorizationId,
+    string? PayPalCaptureId);
 

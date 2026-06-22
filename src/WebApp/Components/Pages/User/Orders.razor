@@ -1,4 +1,4 @@
-﻿@page "/user/orders"
+@page "/user/orders"
 @attribute [Authorize]
 @attribute [StreamRendering]
 @inject OrderingService OrderingService
@@ -24,6 +24,7 @@ else
             <div>Date</div>
             <div class="total-header">Total</div>
             <div>Status</div>
+            <div>Actions</div>
         </li>
         @foreach (var order in orders)
         {
@@ -42,6 +43,15 @@ else
                         @order.Status
                     </span>
                 </div>
+                <div class="order-actions">
+                    @if (CanCancel(order.Status))
+                    {
+                        <EditForm Model="@CancelInput" FormName="@($"cancel-order-{order.OrderNumber}")" OnSubmit="@HandleCancelAsync" Enhance>
+                            <input type="hidden" name="CancelInput.OrderNumber" value="@order.OrderNumber" />
+                            <button type="submit" class="button button-secondary">Cancel order</button>
+                        </EditForm>
+                    }
+                </div>
             </li>
         }
     </ul>
@@ -51,8 +61,35 @@ else
 @code {
     private OrderRecord[]? orders;
 
+    [SupplyParameterFromForm]
+    public CancelOrderModel CancelInput { get; set; } = default!;
+
     protected override async Task OnInitializedAsync()
     {
+        CancelInput ??= new();
         orders = await OrderingService.GetOrders();
+    }
+
+    private async Task HandleCancelAsync()
+    {
+        if (CancelInput?.OrderNumber > 0)
+        {
+            await OrderingService.CancelOrder(CancelInput.OrderNumber, Guid.NewGuid());
+        }
+
+        CancelInput = new();
+
+        // Re-fetch so the list reflects the new (Cancelled) status.
+        orders = await OrderingService.GetOrders();
+    }
+
+    // An order can be cancelled only before it is paid (mirrors the domain rule:
+    // cancelling a Paid or Shipped order is forbidden).
+    private static bool CanCancel(string status)
+        => status is "Submitted" or "AwaitingValidation" or "StockConfirmed";
+
+    public class CancelOrderModel
+    {
+        public int OrderNumber { get; set; }
     }
 }

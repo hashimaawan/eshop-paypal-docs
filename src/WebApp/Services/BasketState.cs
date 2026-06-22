@@ -104,7 +104,8 @@ public class BasketState(
             CardTypeId: checkoutInfo.CardTypeId,
             Buyer: buyerId,
             Items: [.. orderItems],
-            PayPalOrderId: checkoutInfo.PayPalOrderId);
+            PayPalOrderId: checkoutInfo.PayPalOrderId,
+            PayPalAuthorizationId: checkoutInfo.PayPalAuthorizationId);
         await orderingService.CreateOrder(request, checkoutInfo.RequestId);
         await DeleteBasketAsync();
     }
@@ -171,4 +172,5 @@ public record CreateOrderRequest(
     int CardTypeId,
     string Buyer,
     List<BasketItem> Items,
-    string? PayPalOrderId);
+    string? PayPalOrderId,
+    string? PayPalAuthorizationId);

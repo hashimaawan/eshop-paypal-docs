@@ -25,6 +25,7 @@ public class OrderQueries(OrderingContext context)
             Status = order.OrderStatus.ToString(),
             Total = order.GetTotal(),
             PayPalOrderId = order.PayPalOrderId,
+            PayPalAuthorizationId = order.PayPalAuthorizationId,
             OrderItems = order.OrderItems.Select(oi => new Orderitem
             {
                 ProductName = oi.ProductName,

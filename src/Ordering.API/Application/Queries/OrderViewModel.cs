@@ -23,6 +23,7 @@ public record Order
     public List<Orderitem> OrderItems { get; set; } = new List<Orderitem>();
     public decimal Total { get; set; }
     public string? PayPalOrderId { get; init; }
+    public string? PayPalAuthorizationId { get; init; }
 }
 
 public record OrderSummary

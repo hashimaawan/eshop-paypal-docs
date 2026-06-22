@@ -39,7 +39,7 @@ public class CreateOrderCommandHandler
         var address = new Address(message.Street, message.City, message.State, message.Country, message.ZipCode);
         var order = new Order(message.UserId, message.UserName, address, message.CardTypeId,
             message.CardNumber, message.CardSecurityNumber, message.CardHolderName, message.CardExpiration,
-            payPalOrderId: message.PayPalOrderId);
+            payPalOrderId: message.PayPalOrderId, payPalAuthorizationId: message.PayPalAuthorizationId);
 
         foreach (var item in message.OrderItems)
         {

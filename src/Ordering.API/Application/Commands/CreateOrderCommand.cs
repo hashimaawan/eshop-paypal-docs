@@ -62,6 +62,9 @@ public class CreateOrderCommand
     [DataMember]
     public string? PayPalOrderId { get; private set; }
 
+    [DataMember]
+    public string? PayPalAuthorizationId { get; private set; }
+
     public CreateOrderCommand()
     {
         _orderItems = new List<OrderItemDTO>();
@@ -69,7 +72,7 @@ public class CreateOrderCommand
 
     public CreateOrderCommand(List<BasketItem> basketItems, string userId, string userName, string city, string street, string state, string country, string zipcode,
         string cardNumber, string cardHolderName, DateTime cardExpiration,
-        string cardSecurityNumber, int cardTypeId, string? payPalOrderId = null)
+        string cardSecurityNumber, int cardTypeId, string? payPalOrderId = null, string? payPalAuthorizationId = null)
     {
         _orderItems = basketItems.ToOrderItemsDTO().ToList();
         UserId = userId;
@@ -85,6 +88,7 @@ public class CreateOrderCommand
         CardSecurityNumber = cardSecurityNumber;
         CardTypeId = cardTypeId;
         PayPalOrderId = payPalOrderId;
+        PayPalAuthorizationId = payPalAuthorizationId;
     }
 }
 

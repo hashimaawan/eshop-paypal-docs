@@ -37,6 +37,10 @@ public class Order
 
     public string? PayPalOrderId { get; private set; }
 
+    public string? PayPalAuthorizationId { get; private set; }
+
+    public string? PayPalCaptureId { get; private set; }
+
     public static Order NewDraft()
     {
         var order = new Order
@@ -57,11 +61,13 @@ public class Order
     }
 
     public Order(string userId, string userName, Address address, int cardTypeId, string cardNumber, string cardSecurityNumber,
-            string cardHolderName, DateTime cardExpiration, int? buyerId = null, int? paymentMethodId = null, string? payPalOrderId = null) : this()
+            string cardHolderName, DateTime cardExpiration, int? buyerId = null, int? paymentMethodId = null,
+            string? payPalOrderId = null, string? payPalAuthorizationId = null) : this()
     {
         BuyerId = buyerId;
         PaymentId = paymentMethodId;
         PayPalOrderId = payPalOrderId;
+        PayPalAuthorizationId = payPalAuthorizationId;
         OrderStatus = OrderStatus.Submitted;
         OrderDate = DateTime.UtcNow;
         Address = address;
@@ -102,6 +108,19 @@ public class Order
     {
         BuyerId = buyerId;
         PaymentId = paymentId;
+    }
+
+    // UC3: when an aged authorization is re-authorized, the fresh authorization id
+    // must travel with the order so a later capture or void targets the live hold.
+    public void SetPayPalAuthorizationId(string payPalAuthorizationId)
+    {
+        PayPalAuthorizationId = payPalAuthorizationId;
+    }
+
+    // UC2: record the capture id as the settlement reference on the paid order.
+    public void SetPayPalCaptureId(string payPalCaptureId)
+    {
+        PayPalCaptureId = payPalCaptureId;
     }
     
     public void SetAwaitingValidationStatus()

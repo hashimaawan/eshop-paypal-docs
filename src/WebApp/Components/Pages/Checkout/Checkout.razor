@@ -12,6 +12,7 @@
     <EditForm EditContext="@editContext" FormName="checkout" OnSubmit="@HandleSubmitAsync" Enhance>
         <DataAnnotationsValidator />
         <input type="hidden" name="Info.PayPalOrderId" value="@Info.PayPalOrderId" />
+        <input type="hidden" name="Info.PayPalAuthorizationId" value="@Info.PayPalAuthorizationId" />
         <div class="form">
             <div class="form-section">
                 <h2>Shipping address</h2>
@@ -55,6 +56,10 @@
                 <p class="payment-note">
                     Your payment will be securely processed via PayPal.
                 </p>
+                @if (!string.IsNullOrEmpty(paymentError))
+                {
+                    <p class="payment-error">@paymentError</p>
+                }
                 @if (paymentCompleted)
                 {
                     <p class="payment-success">
@@ -82,6 +87,7 @@
     private EditContext editContext = default!;
     private ValidationMessageStore extraMessages = default!;
     private bool paymentCompleted;
+    private string? paymentError;
 
     [SupplyParameterFromForm]
     public BasketCheckoutInfo Info { get; set; } = default!;
@@ -99,37 +105,50 @@
         editContext = new EditContext(Info!);
         extraMessages = new ValidationMessageStore(editContext);
 
-        // Detect if user is returning from PayPal with an approved payment.
-        // We only trust the paypalOrderId query value when it matches the value
-        // that was stored server-side in the session when the PayPal order was
-        // first created in the /paypal/pay endpoint.
+        // UC1 failure state: surface a message when PayPal approval/authorization didn't complete.
+        paymentError = HttpContext.Request.Query["error"].ToString() switch
+        {
+            "authorization_failed" => "Your payment could not be approved by PayPal. Please try again.",
+            "payment_failed" => "We couldn't reach PayPal to approve your payment. Please try again.",
+            "payment_mismatch" => "We couldn't verify your PayPal approval. Please try again.",
+            _ => null
+        };
+
+        // Detect if user is returning from PayPal with an approved and authorized payment.
+        // Both the PayPal order id and authorization id must match session values that were
+        // stored server-side during /paypal/pay and /paypal/return respectively.
         var paid = HttpContext.Request.Query["paid"].ToString();
+
         var paypalOrderIdFromQuery = HttpContext.Request.Query["paypalOrderId"].ToString();
         var paypalOrderIdFromForm = Info!.PayPalOrderId;
         var paypalOrderIdFromSession = HttpContext.Session.GetString(PayPalSessionKeys.OrderId);
+
+        var paypalAuthorizationIdFromQuery = HttpContext.Request.Query["paypalAuthorizationId"].ToString();
+        var paypalAuthorizationIdFromForm = Info!.PayPalAuthorizationId;
+        var paypalAuthorizationIdFromSession = HttpContext.Session.GetString(PayPalSessionKeys.AuthorizationId);
 
         var paypalOrderId = !string.IsNullOrWhiteSpace(paypalOrderIdFromQuery)
             ? paypalOrderIdFromQuery
             : paypalOrderIdFromForm;
 
+        var paypalAuthorizationId = !string.IsNullOrWhiteSpace(paypalAuthorizationIdFromQuery)
+            ? paypalAuthorizationIdFromQuery
+            : paypalAuthorizationIdFromForm;
+
         var orderIdsMatch = !string.IsNullOrWhiteSpace(paypalOrderId)
                             && string.Equals(paypalOrderId, paypalOrderIdFromSession, StringComparison.Ordinal);
 
-        // For the initial redirect back from PayPal we require paid=1.
-        // For the subsequent enhanced-form POST (Place order), the query string may be absent,
-        // so we also treat POST as a continuation as long as the PayPal order id matches session.
-        paymentCompleted = orderIdsMatch
+        var authIdsMatch = !string.IsNullOrWhiteSpace(paypalAuthorizationId)
+                           && string.Equals(paypalAuthorizationId, paypalAuthorizationIdFromSession, StringComparison.Ordinal);
+
+        paymentCompleted = orderIdsMatch && authIdsMatch
                            && (string.Equals(paid, "1", StringComparison.Ordinal)
                                || HttpMethods.IsPost(HttpContext.Request.Method));
 
-        // Only associate the PayPal order ID with this checkout when the approval
-        // flag is present, the query token matches the session-stored id and we
-        // consider the payment completed.
-        // Note: we clear the session value only after the order is successfully created,
-        // otherwise enhanced form posts would lose the PayPal order id.
         if (paymentCompleted)
         {
             Info!.PayPalOrderId = paypalOrderId;
+            Info!.PayPalAuthorizationId = paypalAuthorizationId;
         }
     }
 
@@ -164,16 +183,9 @@
         Info.CardTypeId = 1;
         await Basket.CheckoutAsync(Info);
 
-        // Clear the PayPal order id from session once we've successfully placed the order.
-        // This prevents reuse of the approval token on subsequent checkouts.
-        if (!string.IsNullOrWhiteSpace(Info.PayPalOrderId))
-        {
-            var paypalOrderIdFromSession = HttpContext.Session.GetString(PayPalSessionKeys.OrderId);
-            if (string.Equals(Info.PayPalOrderId, paypalOrderIdFromSession, StringComparison.Ordinal))
-            {
-                HttpContext.Session.Remove(PayPalSessionKeys.OrderId);
-            }
-        }
+        // Clear PayPal session keys once the order is placed to prevent reuse.
+        HttpContext.Session.Remove(PayPalSessionKeys.OrderId);
+        HttpContext.Session.Remove(PayPalSessionKeys.AuthorizationId);
         Nav.NavigateTo("user/orders");
     }
 

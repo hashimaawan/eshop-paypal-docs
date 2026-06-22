@@ -33,6 +33,14 @@ class OrderEntityTypeConfiguration : IEntityTypeConfiguration<Order>
             .Property(o => o.PayPalOrderId)
             .HasMaxLength(64);
 
+        orderConfiguration
+            .Property(o => o.PayPalAuthorizationId)
+            .HasMaxLength(256);
+
+        orderConfiguration
+            .Property(o => o.PayPalCaptureId)
+            .HasMaxLength(64);
+
         orderConfiguration.HasOne(o => o.Buyer)
             .WithMany()
             .HasForeignKey(o => o.BuyerId);
